@@ -1,0 +1,13 @@
+{
+  "name": "movie-translator",
+  "version": "1.0.0",
+  "description": "Movie Translator project",
+  "scripts": {
+    "dev": "concurrently \"cd backend && node server.js\" \"cd frontend && npm run dev\"",
+    "build": "cd frontend && npm run build",
+    "start": "cd frontend && npm start"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
