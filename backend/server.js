@@ -5,6 +5,7 @@ const cors = require('cors');
 const passport = require('./config/passport');
 const authRoutes = require('./routes/auth');
 const uploadRoutes = require('./routes/upload');
+const translateRoutes = require('./routes/translate');
 
 const app = express();
 
@@ -15,6 +16,7 @@ app.use('/uploads', express.static('uploads'));
 
 app.use('/auth', authRoutes);
 app.use('/api', uploadRoutes);
+app.use('/translate', translateRoutes);
 
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('MongoDB connected'))

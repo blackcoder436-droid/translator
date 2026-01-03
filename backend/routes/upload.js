@@ -237,4 +237,66 @@ router.get('/upload/status/:id', async (req, res) => {
   }
 });
 
+// Update project: replace SRT text and/or update studio settings
+router.put('/projects/:id', async (req, res) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ message: 'Unauthorized' });
+  let decoded;
+  try {
+    decoded = jwt.verify(token, process.env.JWT_SECRET);
+  } catch (err) {
+    return res.status(401).json({ message: 'Invalid token' });
+  }
+
+  try {
+    const project = await Project.findOne({ _id: req.params.id, userId: decoded.id });
+    if (!project) {
+      // If project exists but belongs to another user, return 403 to indicate forbidden
+      const found = await Project.findById(req.params.id);
+      if (found) {
+        console.warn('Project update forbidden - user mismatch', { projectUser: found.userId.toString(), requester: decoded.id });
+        return res.status(403).json({ message: 'Forbidden' });
+      }
+      return res.status(404).json({ message: 'Project not found' });
+    }
+
+    const { srtText, studioSettings } = req.body;
+    // If srtText provided, write/overwrite srt file
+    if (typeof srtText === 'string' && srtText.trim().length > 0) {
+      try {
+        // ensure project.srtPath exists or derive from videoPath
+        let srtFileName = project.srtPath;
+        if (!srtFileName || srtFileName.trim() === '') {
+          const baseName = path.basename(project.videoPath || '', path.extname(project.videoPath || '')) || Date.now().toString();
+          srtFileName = baseName + '.srt';
+        }
+        const srtFull = path.join('uploads', srtFileName);
+        fs.writeFileSync(srtFull, srtText, { encoding: 'utf8' });
+        // update project srtPath if it was empty
+        if (!project.srtPath || project.srtPath !== srtFileName) project.srtPath = srtFileName;
+      } catch (wErr) {
+        console.error('Failed to write SRT during project update', wErr);
+        return res.status(500).json({ message: 'Failed to write srt file' });
+      }
+    }
+
+    // Update studio settings if provided
+    if (studioSettings && typeof studioSettings === 'object') {
+      project.studioSettings = studioSettings;
+    }
+
+    await project.save();
+    // notify via socket
+    try {
+      const io = req.app.get('io');
+      if (io) io.to(`project_${project._id}`).emit('project:update', { projectId: project._id.toString(), status: project.status, progress: project.progress, srtPath: project.srtPath });
+    } catch (e) { }
+
+    res.json({ message: 'Project updated', projectId: project._id, srtPath: project.srtPath });
+  } catch (err) {
+    console.error('Project update failed', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 module.exports = router;
