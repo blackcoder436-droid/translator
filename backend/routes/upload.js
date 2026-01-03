@@ -36,62 +36,143 @@ router.post('/upload', upload.single('movie'), async (req, res) => {
   }
 
   const movieFile = req.file;
-
-  // Always extract SRT from video
-  let srtContent;
+  const targetLang = req.body.targetLang || '';
+  const sourceLang = req.body.sourceLang || 'auto';
+  // Create project entry immediately with processing status
+  const baseName = path.basename(movieFile.filename, path.extname(movieFile.filename));
+  const placeholderSrt = '';
+  let project;
   try {
-    srtContent = await new Promise((resolve, reject) => {
-      exec(`python ../python/extract_srt.py "${movieFile.path}"`, (err, stdout, stderr) => {
-        if (err) {
-          console.error('Python error:', stderr);
-          reject(err);
-        } else {
-          resolve(stdout);
-        }
-      });
+    project = new Project({
+      userId: decoded.id,
+      projectName: req.body.projectName || 'Unnamed Project',
+      videoPath: movieFile.path,
+      srtPath: placeholderSrt,
+      status: 'processing',
+      progress: 0
     });
-  } catch (err) {
-    console.log('Falling back to sample SRT');
-    srtContent = `1
-00:00:00,000 --> 00:00:05,000
-Hello, welcome to this video.
-
-2
-00:00:05,000 --> 00:00:10,000
-This is a demonstration of subtitle extraction.
-
-3
-00:00:10,000 --> 00:00:15,000
-The system is processing the audio from ${movieFile.originalname}.
-
-4
-00:00:15,000 --> 00:00:20,000
-Transcribed content will appear here when AI is enabled.
-`;
+    await project.save();
+    // Notify via websocket that a project was created/queued
+    try {
+      const io = req.app.get('io');
+      if (io) {
+        io.to(`user_${decoded.id}`).emit('project:update', { projectId: project._id.toString(), status: 'processing', progress: 0 });
+      }
+    } catch (e) {
+      console.warn('Emit project created failed', e);
+    }
+  } catch (dbErr) {
+    console.error('DB create failed', dbErr);
+    return res.status(500).json({ message: 'Database error' });
   }
 
-  const baseName = path.basename(movieFile.filename, path.extname(movieFile.filename));
-  const srtPath = path.join('uploads', baseName + '.srt');
+  // Respond immediately with project id so client can poll status
+  res.json({ message: 'Upload received', projectId: project._id });
 
-  fs.writeFile(srtPath, srtContent, async (err) => {
-    if (err) {
-      console.error(err);
-      return res.status(500).json({ message: 'File write failed' });
-    }
+  // Process in background: extract SRT, optionally translate, then update project
+  (async () => {
     try {
-      const project = new Project({
-        userId: decoded.id,
-        projectName: req.body.projectName || 'Unnamed Project',
-        videoPath: movieFile.path,
-        srtPath: baseName + '.srt'
+      // Update progress to 10% (queued)
+      await Project.findByIdAndUpdate(project._id, { progress: 10 });
+      try { const io = req.app.get('io'); if (io) io.to(`project_${project._id}`).emit('project:update', { projectId: project._id.toString(), status: 'processing', progress: 10 }); } catch(e){ }
+
+      // Mark extraction started
+      await Project.findByIdAndUpdate(project._id, { progress: 30 });
+      try { const io = req.app.get('io'); if (io) io.to(`project_${project._id}`).emit('project:update', { projectId: project._id.toString(), status: 'processing', progress: 30 }); } catch(e){ }
+
+      // Run extractor with timeout and increased buffer to avoid hanging
+      const srtContent = await new Promise((resolve, reject) => {
+        exec(`python ../python/extract_srt.py "${movieFile.path}" "${sourceLang}"`, { timeout: 300000, maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
+          if (err) {
+            console.error('Python extractor error:', err, stderr.toString());
+            reject(err);
+          } else {
+            resolve(stdout);
+          }
+        });
       });
-      await project.save();
-      res.json({ message: 'SRT extracted', srtPath: baseName + '.srt' });
-    } catch (dbErr) {
-      console.error(dbErr);
-      res.status(500).json({ message: 'Database error' });
+
+      // Extraction finished
+      await Project.findByIdAndUpdate(project._id, { progress: 60 });
+      try { const io = req.app.get('io'); if (io) io.to(`project_${project._id}`).emit('project:update', { projectId: project._id.toString(), status: 'processing', progress: 60 }); } catch(e){ }
+
+      let finalSrtPath = baseName + '.srt';
+      try {
+        const srtPath = path.join('uploads', baseName + '.srt');
+        fs.writeFileSync(srtPath, srtContent, { encoding: 'utf8' });
+        // verify file written and non-empty
+        let srtStatOk = false;
+        try {
+          const st = fs.statSync(srtPath);
+          srtStatOk = st && st.size > 0;
+        } catch (stErr) {
+          console.warn('SRT stat failed', stErr);
+          srtStatOk = false;
+        }
+        if (!srtStatOk) {
+          console.error('SRT file is empty or missing:', srtPath);
+          await Project.findByIdAndUpdate(project._id, { status: 'failed', progress: 100 });
+          return;
+        }
+
+        // If targetLang requested and different, translate segment texts
+        if (targetLang) {
+          try {
+            const blocks = srtContent.split(/\r?\n\r?\n/).filter(Boolean);
+            const translatedBlocks = [];
+            for (const block of blocks) {
+              const lines = block.split(/\r?\n/);
+              if (lines.length < 3) { translatedBlocks.push(block); continue; }
+              const idx = lines[0];
+              const time = lines[1];
+              const text = lines.slice(2).join('\n');
+
+              const translateResp = await fetch('https://libretranslate.de/translate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ q: text, source: sourceLang || 'auto', target: targetLang, format: 'text' })
+              });
+              if (translateResp.ok) {
+                const json = await translateResp.json();
+                const translated = json.translatedText || text;
+                translatedBlocks.push(`${idx}\n${time}\n${translated}`);
+              } else {
+                translatedBlocks.push(`${idx}\n${time}\n${text}`);
+              }
+            }
+            const translatedSrt = translatedBlocks.join('\n\n') + '\n\n';
+            const translatedPath = path.join('uploads', baseName + `_${targetLang}.srt`);
+            fs.writeFileSync(translatedPath, translatedSrt, { encoding: 'utf8' });
+            // verify translated file
+            try {
+              const st2 = fs.statSync(translatedPath);
+              if (st2 && st2.size > 0) {
+                finalSrtPath = baseName + `_${targetLang}.srt`;
+              } else {
+                console.warn('Translated SRT empty, keeping original');
+              }
+            } catch (s2Err) {
+              console.warn('Translated SRT stat failed, keeping original', s2Err);
+            }
+          } catch (tErr) {
+            console.warn('Translation failed, using original SRT', tErr);
+          }
+        }
+
+        // Update project with final srt and mark complete
+        await Project.findByIdAndUpdate(project._id, { srtPath: finalSrtPath, status: 'completed', progress: 100 });
+        try { const io = req.app.get('io'); if (io) io.to(`project_${project._id}`).emit('project:update', { projectId: project._id.toString(), status: 'completed', progress: 100, srtPath: finalSrtPath }); if (io) io.to(`user_${decoded.id}`).emit('project:update', { projectId: project._id.toString(), status: 'completed', progress: 100, srtPath: finalSrtPath }); } catch(e){ }
+      } catch (fileErr) {
+        console.error('SRT write failed:', fileErr);
+        await Project.findByIdAndUpdate(project._id, { status: 'failed', progress: 100 });
+        try { const io = req.app.get('io'); if (io) io.to(`project_${project._id}`).emit('project:update', { projectId: project._id.toString(), status: 'failed', progress: 100 }); } catch(e){ }
+      }
+    } catch (err) {
+      console.error('Processing failed for project', project._id, err);
+      try { await Project.findByIdAndUpdate(project._id, { status: 'failed', progress: 100 }); } catch(e){}
+      try { const io = req.app.get('io'); if (io) io.to(`project_${project._id}`).emit('project:update', { projectId: project._id.toString(), status: 'failed', progress: 100 }); } catch(e){ }
     }
-  });
+  })();
 });
 
 // Get projects for user
@@ -104,6 +185,55 @@ router.get('/projects', async (req, res) => {
     res.json({ projects });
   } catch (err) {
     res.status(401).json({ message: 'Invalid token' });
+  }
+});
+
+// Delete a project (and its files)
+router.delete('/projects/:id', async (req, res) => {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ message: 'Unauthorized' });
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    console.log('DELETE /projects/:id called', { id: req.params.id, userId: decoded.id });
+    let project = await Project.findOne({ _id: req.params.id, userId: decoded.id });
+    if (!project) {
+      // check if project exists but belongs to another user
+      const found = await Project.findById(req.params.id);
+      if (found) {
+        console.warn('Project exists but user mismatch', { projectUser: found.userId.toString(), requester: decoded.id });
+        return res.status(403).json({ message: 'Forbidden' });
+      }
+      return res.status(404).json({ message: 'Project not found' });
+    }
+
+    // Remove files if they exist
+    try {
+      if (project.videoPath && fs.existsSync(project.videoPath)) fs.unlinkSync(project.videoPath);
+    } catch (e) {
+      console.warn('Failed to remove video file', e);
+    }
+    try {
+      const srtFull = path.join('uploads', project.srtPath);
+      if (project.srtPath && fs.existsSync(srtFull)) fs.unlinkSync(srtFull);
+    } catch (e) {
+      console.warn('Failed to remove srt file', e);
+    }
+
+    await project.deleteOne();
+    res.json({ message: 'Project deleted' });
+  } catch (err) {
+    res.status(401).json({ message: 'Invalid token' });
+  }
+});
+
+// Status endpoint for client polling
+router.get('/upload/status/:id', async (req, res) => {
+  try {
+    const proj = await Project.findById(req.params.id);
+    if (!proj) return res.status(404).json({ message: 'Not found' });
+    res.json({ status: proj.status, progress: proj.progress, srtPath: proj.srtPath });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
