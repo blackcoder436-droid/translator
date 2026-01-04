@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import sys
 
-def extract_srt(video_path):
+def extract_srt(video_path, language=None):
     # First try to extract embedded subtitle stream with ffmpeg (fast and preserves original timings/text)
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -32,20 +32,17 @@ def extract_srt(video_path):
     model_name = os.environ.get('WHISPER_MODEL', 'small')
     model = whisper.load_model(model_name)
 
-    # If caller provided a language hint, use it to avoid autodetect failures
-    # The second CLI arg (if present) is treated as the source language code or 'auto'
-    lang = None
-    try:
-        if len(sys.argv) > 2:
-            arg_lang = sys.argv[2]
-            if arg_lang and arg_lang.lower() != 'auto':
-                lang = arg_lang
-    except Exception:
-        lang = None
-
+    # Prepare transcription kwargs
+    # If language is specified and not 'auto', use it; otherwise let Whisper auto-detect
     transcribe_kwargs = {}
-    if lang:
-        transcribe_kwargs['language'] = lang
+    if language and language.lower() != 'auto':
+        # Map common language codes to Whisper's expected codes
+        lang_map = {
+            'en': 'en', 'my': 'my', 'th': 'th', 'zh': 'zh',
+            'ja': 'ja', 'ko': 'ko', 'vi': 'vi'
+        }
+        whisper_lang = lang_map.get(language.lower(), language.lower())
+        transcribe_kwargs['language'] = whisper_lang
 
     result = model.transcribe(video_path, **transcribe_kwargs)
 
@@ -67,8 +64,14 @@ def format_time(seconds):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print('Usage: extract_srt.py <video_path> [sourceLang]', file=sys.stderr)
+        print('Usage: extract_srt.py <video_path> [language]', file=sys.stderr)
         sys.exit(2)
     video_path = sys.argv[1]
-    srt_content = extract_srt(video_path)
-    print(srt_content)
+    language = sys.argv[2] if len(sys.argv) > 2 else 'auto'
+    srt_content = extract_srt(video_path, language)
+    # Handle Unicode output properly on Windows
+    if sys.stdout.encoding != 'utf-8':
+        # Write directly to stdout buffer with UTF-8 encoding
+        sys.stdout.buffer.write(srt_content.encode('utf-8'))
+    else:
+        print(srt_content, end='')

@@ -20,8 +20,8 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage });
 
-// Upload route
-router.post('/upload', upload.single('movie'), async (req, res) => {
+// Upload route - accepts both movie and optional srt file
+router.post('/upload', upload.fields([{ name: 'movie', maxCount: 1 }, { name: 'srt', maxCount: 1 }]), async (req, res) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ message: 'Unauthorized' });
   let decoded;
@@ -31,11 +31,12 @@ router.post('/upload', upload.single('movie'), async (req, res) => {
     return res.status(401).json({ message: 'Invalid token' });
   }
 
-  if (!req.file) {
-    return res.status(400).json({ message: 'No file uploaded' });
+  if (!req.files || !req.files.movie) {
+    return res.status(400).json({ message: 'No movie file uploaded' });
   }
 
-  const movieFile = req.file;
+  const movieFile = req.files.movie[0];
+  const srtFile = req.files.srt ? req.files.srt[0] : null;
   const targetLang = req.body.targetLang || '';
   const sourceLang = req.body.sourceLang || 'auto';
   // Create project entry immediately with processing status
@@ -76,25 +77,48 @@ router.post('/upload', upload.single('movie'), async (req, res) => {
       await Project.findByIdAndUpdate(project._id, { progress: 10 });
       try { const io = req.app.get('io'); if (io) io.to(`project_${project._id}`).emit('project:update', { projectId: project._id.toString(), status: 'processing', progress: 10 }); } catch(e){ }
 
-      // Mark extraction started
-      await Project.findByIdAndUpdate(project._id, { progress: 30 });
-      try { const io = req.app.get('io'); if (io) io.to(`project_${project._id}`).emit('project:update', { projectId: project._id.toString(), status: 'processing', progress: 30 }); } catch(e){ }
+      let srtContent = '';
+      
+      // If SRT file was provided by user, use it directly
+      if (srtFile) {
+        try {
+          srtContent = fs.readFileSync(srtFile.path, 'utf8');
+          console.log('Using uploaded SRT file:', srtFile.path);
+          await Project.findByIdAndUpdate(project._id, { progress: 60 });
+          try { const io = req.app.get('io'); if (io) io.to(`project_${project._id}`).emit('project:update', { projectId: project._id.toString(), status: 'processing', progress: 60 }); } catch(e){ }
+        } catch (srtErr) {
+          console.error('Failed to read uploaded SRT file:', srtErr);
+          await Project.findByIdAndUpdate(project._id, { status: 'failed', progress: 100 });
+          return;
+        }
+      } else {
+        // Mark extraction started
+        await Project.findByIdAndUpdate(project._id, { progress: 30 });
+        try { const io = req.app.get('io'); if (io) io.to(`project_${project._id}`).emit('project:update', { projectId: project._id.toString(), status: 'processing', progress: 30 }); } catch(e){ }
 
-      // Run extractor with timeout and increased buffer to avoid hanging
-      const srtContent = await new Promise((resolve, reject) => {
-        exec(`python ../python/extract_srt.py "${movieFile.path}" "${sourceLang}"`, { timeout: 300000, maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
-          if (err) {
-            console.error('Python extractor error:', err, stderr.toString());
-            reject(err);
-          } else {
-            resolve(stdout);
-          }
+        // Run extractor with timeout and increased buffer to avoid hanging
+        // Use 'auto' for automatic language detection
+        srtContent = await new Promise((resolve, reject) => {
+          exec(`python ../python/extract_srt.py "${movieFile.path}" "auto"`, { timeout: 300000, maxBuffer: 1024 * 1024 * 10, shell: true, encoding: 'utf8' }, (err, stdout, stderr) => {
+            if (err) {
+              console.error('Python extractor error:', err.message);
+              console.error('STDERR:', stderr.toString());
+              reject(new Error(`Extraction failed: ${stderr.toString() || err.message}`));
+            } else if (!stdout || stdout.trim().length === 0) {
+              console.error('Python extractor returned empty output');
+              reject(new Error('Extraction failed: No output from Python script'));
+            } else {
+              // Decode UTF-8 if needed
+              const decoded = typeof stdout === 'string' ? stdout : Buffer.from(stdout).toString('utf8');
+              resolve(decoded);
+            }
+          });
         });
-      });
 
-      // Extraction finished
-      await Project.findByIdAndUpdate(project._id, { progress: 60 });
-      try { const io = req.app.get('io'); if (io) io.to(`project_${project._id}`).emit('project:update', { projectId: project._id.toString(), status: 'processing', progress: 60 }); } catch(e){ }
+        // Extraction finished
+        await Project.findByIdAndUpdate(project._id, { progress: 60 });
+        try { const io = req.app.get('io'); if (io) io.to(`project_${project._id}`).emit('project:update', { projectId: project._id.toString(), status: 'processing', progress: 60 }); } catch(e){ }
+      }
 
       let finalSrtPath = baseName + '.srt';
       try {
@@ -130,7 +154,7 @@ router.post('/upload', upload.single('movie'), async (req, res) => {
               const translateResp = await fetch('https://libretranslate.de/translate', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ q: text, source: sourceLang || 'auto', target: targetLang, format: 'text' })
+                body: JSON.stringify({ q: text, source: 'auto', target: targetLang, format: 'text' })
               });
               if (translateResp.ok) {
                 const json = await translateResp.json();
