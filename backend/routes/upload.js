@@ -315,20 +315,22 @@ router.put('/projects/:id', async (req, res) => {
       return res.status(404).json({ message: 'Project not found' });
     }
 
-    const { srtText, studioSettings } = req.body;
+    const { srtText, studioSettings, translatedFileName } = req.body;
     // If srtText provided, write/overwrite srt file
     if (typeof srtText === 'string' && srtText.trim().length > 0) {
       try {
-        // ensure project.srtPath exists or derive from videoPath
-        let srtFileName = project.srtPath;
+        // If translatedFileName is provided, use it for the filename (for translated versions)
+        let srtFileName = translatedFileName || project.srtPath;
         if (!srtFileName || srtFileName.trim() === '') {
           const baseName = path.basename(project.videoPath || '', path.extname(project.videoPath || '')) || Date.now().toString();
           srtFileName = baseName + '.srt';
         }
         const srtFull = path.join('uploads', srtFileName);
         fs.writeFileSync(srtFull, srtText, { encoding: 'utf8' });
-        // update project srtPath if it was empty
-        if (!project.srtPath || project.srtPath !== srtFileName) project.srtPath = srtFileName;
+        // update project srtPath if it was empty and this is not a translated file
+        if (!translatedFileName && (!project.srtPath || project.srtPath !== srtFileName)) {
+          project.srtPath = srtFileName;
+        }
       } catch (wErr) {
         console.error('Failed to write SRT during project update', wErr);
         return res.status(500).json({ message: 'Failed to write srt file' });
@@ -684,3 +686,140 @@ router.get('/projects/:id/download', async (req, res) => {
     return res.status(500).json({ message: 'Server error' });
   }
 });
+
+// Extract SRT from a Cloud (Google Drive) video
+router.post('/extract-cloud-srt', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.split(' ')[1];
+  if (!token) return res.status(401).json({ message: 'No token' });
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const User = require('../models/User');
+    const user = await User.findById(decoded.id);
+    if (!user || !user.googleRefreshToken) {
+      return res.status(400).json({ message: 'No Google refresh token' });
+    }
+
+    const { fileId, language } = req.body;
+    if (!fileId) return res.status(400).json({ message: 'fileId required' });
+
+    const axios = require('axios');
+
+    // Get fresh access token
+    const tokenRes = await axios.post('https://oauth2.googleapis.com/token', {
+      client_id: process.env.GOOGLE_CLIENT_ID,
+      client_secret: process.env.GOOGLE_CLIENT_SECRET,
+      refresh_token: user.googleRefreshToken,
+      grant_type: 'refresh_token'
+    });
+
+    const accessToken = tokenRes.data.access_token;
+
+    // Download video from Drive to temporary location
+    const tempDir = path.join(process.cwd(), 'uploads', '.temp');
+    if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
+
+    const tempVideoPath = path.join(tempDir, `cloud_${fileId}.mp4`);
+
+    console.log('Downloading Cloud video:', fileId);
+    const fileStream = fs.createWriteStream(tempVideoPath);
+    
+    const driveRes = await axios.get(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      responseType: 'stream'
+    });
+
+    driveRes.data.pipe(fileStream);
+
+    await new Promise((resolve, reject) => {
+      fileStream.on('finish', resolve);
+      fileStream.on('error', reject);
+    });
+
+    console.log('Download complete, extracting SRT...');
+
+    // Extract SRT using Python script
+    const srtContent = await new Promise((resolve, reject) => {
+      const langArg = language || 'auto';
+      exec(`python ../python/extract_srt.py "${tempVideoPath}" "${langArg}"`, 
+        { timeout: 600000, maxBuffer: 1024 * 1024 * 10, shell: true, encoding: 'utf8' }, 
+        (err, stdout, stderr) => {
+          // Clean up temp file
+          try { fs.unlinkSync(tempVideoPath); } catch (e) { }
+
+          if (err) {
+            console.error('Extraction error:', err.message);
+            console.error('STDERR:', stderr);
+            reject(new Error(`Extraction failed: ${stderr || err.message}`));
+            return;
+          }
+
+          if (!stdout) {
+            reject(new Error('No SRT content extracted'));
+            return;
+          }
+
+          resolve(stdout);
+        }
+      );
+    });
+
+    // Return the extracted SRT content
+    return res.json({ srtContent, message: 'SRT extracted successfully' });
+  } catch (err) {
+    console.error('Cloud SRT extraction failed:', err.message);
+    return res.status(500).json({ message: 'Failed to extract SRT', error: err.message });
+  }
+});
+
+// Create a project from a Cloud (Drive) video
+router.post('/create-cloud-project', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.split(' ')[1];
+  if (!token) return res.status(401).json({ message: 'No token' });
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const { fileId, fileName, srtContent } = req.body;
+    if (!fileId || !fileName) {
+      return res.status(400).json({ message: 'fileId and fileName required' });
+    }
+
+    // Create a project in the database
+    const baseName = path.basename(fileName, path.extname(fileName));
+    const srtFileName = baseName + '.srt';
+    
+    // Save SRT content to file
+    const srtPath = path.join('uploads', srtFileName);
+    if (srtContent) {
+      fs.writeFileSync(srtPath, srtContent, 'utf8');
+    }
+
+    // Create project record
+    const project = new Project({
+      userId: decoded.id,
+      projectName: baseName,
+      videoPath: `drive:${fileId}`, // Mark as Cloud project
+      srtPath: srtFileName,
+      driveFileId: fileId,
+      isCloudProject: true,
+      status: 'completed',
+      progress: 100
+    });
+
+    await project.save();
+
+    return res.json({
+      projectId: project._id.toString(),
+      projectName: baseName,
+      srtPath: srtFileName,
+      message: 'Cloud project created successfully'
+    });
+  } catch (err) {
+    console.error('Cloud project creation failed:', err.message);
+    return res.status(500).json({ message: 'Failed to create project', error: err.message });
+  }
+});
+
+module.exports = router;

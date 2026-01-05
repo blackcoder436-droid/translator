@@ -1,0 +1,31 @@
+1
+00:00:00,000 --> 00:00:03,780
+Pokażę Ci jak możesz tworzyć fajne napisy takie jak te do swoich filmów.
+
+2
+00:00:03,780 --> 00:00:04,940
+To naprawdę proste.
+
+3
+00:00:04,940 --> 00:00:07,440
+Najpierw musisz pobrać aplikację o nazwie Capshence.
+
+4
+00:00:07,440 --> 00:00:09,939
+Wiem, że aplikacja tak naprawdę nazywa się Capshence.
+
+5
+00:00:09,939 --> 00:00:12,419
+Następnie musisz zainportować filmy, na których mówisz.
+
+6
+00:00:12,419 --> 00:00:14,859
+A potem pozwól sztucznej inteligencji zrobić swoje.
+
+7
+00:00:14,859 --> 00:00:17,379
+I w kilka sekund, wala, masz swoje napisy.
+
+8
+00:00:17,379 --> 00:00:18,780
+I to jest takie proste.

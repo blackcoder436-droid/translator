@@ -292,6 +292,27 @@ router.post('/upload-to-drive', async (req, res) => {
     // Clean up temp file
     fs.unlinkSync(tempPath);
 
+    // Upsert Drive metadata into MongoDB (single source of truth)
+    try {
+      const DriveFile = require('../models/DriveFile');
+      await DriveFile.findOneAndUpdate(
+        { userId: decoded.id, driveFileId: driveFile.id },
+        {
+          userId: decoded.id,
+          driveFileId: driveFile.id,
+          name: driveFile.name,
+          mimeType: driveFile.mimeType || mimeType,
+          size: driveFile.size || null,
+          modifiedTime: driveFile.modifiedTime || new Date(),
+          webViewLink: driveFile.webViewLink || driveFile.webViewUrl || null,
+          syncedAt: new Date()
+        },
+        { upsert: true, new: true }
+      );
+    } catch (e) {
+      console.warn('Failed to upsert DriveFile metadata after upload', e && e.message ? e.message : e);
+    }
+
     return res.json({
       success: true,
       driveFile: {
@@ -303,6 +324,108 @@ router.post('/upload-to-drive', async (req, res) => {
   } catch (err) {
     console.error('Upload to Drive failed:', err.message);
     return res.status(500).json({ message: 'Upload failed', error: err.message });
+  }
+});
+
+// Sync Drive files to MongoDB cache
+router.post('/sync-drive-files', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.split(' ')[1];
+  if (!token) return res.status(401).json({ message: 'No token' });
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await User.findById(decoded.id);
+    if (!user || !user.googleRefreshToken) {
+      return res.status(400).json({ message: 'No Google refresh token' });
+    }
+
+    // Get fresh access token
+    const tokenRes = await axios.post('https://oauth2.googleapis.com/token', {
+      client_id: process.env.GOOGLE_CLIENT_ID,
+      client_secret: process.env.GOOGLE_CLIENT_SECRET,
+      refresh_token: user.googleRefreshToken,
+      grant_type: 'refresh_token'
+    });
+
+    const accessToken = tokenRes.data.access_token;
+
+    // Fetch video files from Google Drive
+    const driveRes = await axios.get('https://www.googleapis.com/drive/v3/files', {
+      params: {
+        q: "mimeType contains 'video/' and trashed=false",
+        spaces: 'drive',
+        fields: 'files(id, name, mimeType, size, modifiedTime, webViewLink)',
+        pageSize: 1000
+      },
+      headers: { Authorization: `Bearer ${accessToken}` }
+    });
+
+    const DriveFile = require('../models/DriveFile');
+    const files = driveRes.data.files || [];
+    let syncedCount = 0;
+
+    // Upsert each file to MongoDB
+    for (const file of files) {
+      await DriveFile.findOneAndUpdate(
+        { userId: decoded.id, driveFileId: file.id },
+        {
+          userId: decoded.id,
+          driveFileId: file.id,
+          name: file.name,
+          mimeType: file.mimeType,
+          size: file.size,
+          modifiedTime: file.modifiedTime,
+          webViewLink: file.webViewLink,
+          syncedAt: new Date()
+        },
+        { upsert: true, new: true }
+      );
+      syncedCount++;
+    }
+
+    console.log(`Synced ${syncedCount} Drive files for user ${decoded.id}`);
+    return res.json({
+      message: `Synced ${syncedCount} files from Google Drive`,
+      fileCount: syncedCount
+    });
+  } catch (err) {
+    console.error('Drive sync failed:', err.message);
+    return res.status(500).json({ message: 'Failed to sync Drive files', error: err.message });
+  }
+});
+
+// Get cached Drive files from MongoDB
+router.get('/drive-files', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.split(' ')[1];
+  if (!token) return res.status(401).json({ message: 'No token' });
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const DriveFile = require('../models/DriveFile');
+    
+    const files = await DriveFile.find({ userId: decoded.id })
+      .sort({ modifiedTime: -1 })
+      .lean();
+
+    // Format response to match Drive API format
+    const formattedFiles = files.map(f => ({
+      id: f.driveFileId,
+      name: f.name,
+      mimeType: f.mimeType,
+      size: f.size,
+      modifiedTime: f.modifiedTime,
+      webViewLink: f.webViewLink
+    }));
+
+    return res.json({
+      files: formattedFiles,
+      totalSize: files.reduce((sum, f) => sum + (f.size || 0), 0)
+    });
+  } catch (err) {
+    console.error('Failed to get cached Drive files:', err.message);
+    return res.status(500).json({ message: 'Failed to get files', error: err.message });
   }
 });
 

@@ -84,6 +84,72 @@ io.on('connection', (socket) => {
 
 server.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
 
+// Periodic background sync: refresh Drive metadata into MongoDB every 10 minutes
+const axios = require('axios');
+const User = require('./models/User');
+const DriveFile = require('./models/DriveFile');
+
+async function syncAllDriveFiles() {
+  try {
+    const users = await User.find({ googleRefreshToken: { $exists: true, $ne: null } }).lean();
+    for (const user of users) {
+      try {
+        const params = new URLSearchParams();
+        params.append('client_id', process.env.GOOGLE_CLIENT_ID);
+        params.append('client_secret', process.env.GOOGLE_CLIENT_SECRET);
+        params.append('refresh_token', user.googleRefreshToken);
+        params.append('grant_type', 'refresh_token');
+
+        const tokenResp = await axios.post('https://oauth2.googleapis.com/token', params.toString(), {
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+        });
+        const accessToken = tokenResp.data.access_token;
+
+        const driveRes = await axios.get('https://www.googleapis.com/drive/v3/files', {
+          params: {
+            q: "mimeType contains 'video/' and trashed=false",
+            spaces: 'drive',
+            fields: 'files(id, name, mimeType, size, modifiedTime, webViewLink)',
+            pageSize: 1000
+          },
+          headers: { Authorization: `Bearer ${accessToken}` }
+        });
+
+        const files = driveRes.data.files || [];
+        for (const file of files) {
+          try {
+            await DriveFile.findOneAndUpdate(
+              { userId: user._id, driveFileId: file.id },
+              {
+                userId: user._id,
+                driveFileId: file.id,
+                name: file.name,
+                mimeType: file.mimeType,
+                size: file.size,
+                modifiedTime: file.modifiedTime,
+                webViewLink: file.webViewLink,
+                syncedAt: new Date()
+              },
+              { upsert: true, new: true }
+            );
+          } catch (e) {
+            console.warn('Failed to upsert DriveFile for user', user._id, e && e.message ? e.message : e);
+          }
+        }
+        console.log(`Drive sync: user ${user._id} - ${files.length} files`);
+      } catch (uErr) {
+        console.warn('Drive sync failed for user', user._id, uErr && uErr.message ? uErr.message : uErr);
+      }
+    }
+  } catch (err) {
+    console.error('syncAllDriveFiles error', err && err.message ? err.message : err);
+  }
+}
+
+// Run once shortly after startup, then every 10 minutes
+setTimeout(() => { syncAllDriveFiles().catch(e => console.error(e)); }, 30 * 1000);
+setInterval(() => { syncAllDriveFiles().catch(e => console.error(e)); }, 10 * 60 * 1000);
+
 process.on('uncaughtException', (err) => {
   console.error('UNCAUGHT EXCEPTION', err && err.stack ? err.stack : err);
 });
