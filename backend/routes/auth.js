@@ -117,12 +117,12 @@ router.post('/reset-password', async (req, res) => {
   }
 });
 
-// Google Auth - request Drive readonly + offline access at login so permission is granted once
+// Google Auth - request Drive full access + offline access at login so permission is granted once
 console.log('Registering GET /auth/google route');
 router.get('/google', (req, res, next) => {
   console.log('GET /auth/google called');
   passport.authenticate('google', {
-    scope: ['profile', 'email', 'https://www.googleapis.com/auth/drive.readonly'],
+    scope: ['profile', 'email', 'https://www.googleapis.com/auth/drive'],
     accessType: 'offline',
     prompt: 'consent'
   })(req, res, next);
@@ -183,6 +183,126 @@ router.get('/drive-token', async (req, res) => {
   } catch (err) {
     console.error('drive-token error', err?.message || err);
     return res.status(400).json({ message: 'Failed to obtain drive token' });
+  }
+});
+
+// DEBUG: return whether current user has a Google refresh token stored
+router.get('/debug', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.split(' ')[1];
+  if (!token) return res.status(401).json({ message: 'No token' });
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await User.findById(decoded.id).lean();
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    return res.json({
+      email: user.email,
+      googleId: !!user.googleId,
+      hasGoogleRefreshToken: !!user.googleRefreshToken
+    });
+  } catch (err) {
+    return res.status(400).json({ message: 'Invalid token' });
+  }
+});
+
+// Get streaming URL for Google Drive video (authenticated)
+router.get('/drive-video/:fileId', async (req, res) => {
+  // Accept token from Authorization header or query parameter
+  const authHeader = req.headers.authorization;
+  let token = authHeader?.split(' ')[1];
+  if (!token && req.query.token) {
+    token = req.query.token;
+  }
+  if (!token) return res.status(401).json({ message: 'No token' });
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await User.findById(decoded.id);
+    if (!user || !user.googleRefreshToken) {
+      return res.status(400).json({ message: 'No Google refresh token' });
+    }
+
+    // Get fresh access token
+    const tokenRes = await axios.post('https://oauth2.googleapis.com/token', {
+      client_id: process.env.GOOGLE_CLIENT_ID,
+      client_secret: process.env.GOOGLE_CLIENT_SECRET,
+      refresh_token: user.googleRefreshToken,
+      grant_type: 'refresh_token'
+    });
+
+    const accessToken = tokenRes.data.access_token;
+    const fileId = req.params.fileId;
+
+    // Fetch the file from Google Drive and stream it
+    const response = await axios.get(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      responseType: 'stream'
+    });
+
+    // Set proper headers for video streaming
+    res.setHeader('Content-Type', response.headers['content-type'] || 'video/mp4');
+    res.setHeader('Content-Length', response.headers['content-length']);
+    res.setHeader('Accept-Ranges', 'bytes');
+
+    response.data.pipe(res);
+  } catch (err) {
+    console.error('Drive video stream failed:', err.message);
+    return res.status(500).json({ message: 'Failed to stream video', error: err.message });
+  }
+});
+
+// Upload to Google Drive
+router.post('/upload-to-drive', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.split(' ')[1];
+  if (!token) return res.status(401).json({ message: 'No token' });
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await User.findById(decoded.id);
+    if (!user || !user.googleRefreshToken) {
+      return res.status(400).json({ message: 'No Google refresh token available' });
+    }
+
+    // Get fresh access token
+    const tokenRes = await axios.post('https://oauth2.googleapis.com/token', {
+      client_id: process.env.GOOGLE_CLIENT_ID,
+      client_secret: process.env.GOOGLE_CLIENT_SECRET,
+      refresh_token: user.googleRefreshToken,
+      grant_type: 'refresh_token'
+    });
+
+    const accessToken = tokenRes.data.access_token;
+    const { fileName, fileUrl, mimeType } = req.body;
+
+    if (!fileName || !fileUrl) {
+      return res.status(400).json({ message: 'Missing fileName or fileUrl' });
+    }
+
+    // Download file from fileUrl
+    const fileRes = await axios.get(fileUrl, { responseType: 'arraybuffer' });
+    const tempPath = `/tmp/${fileName}`;
+    const fs = require('fs');
+    fs.writeFileSync(tempPath, fileRes.data);
+
+    // Upload to Drive
+    const driveUpload = require('../utils/driveUpload');
+    const driveFile = await driveUpload.uploadToDrive(accessToken, tempPath, fileName, mimeType);
+
+    // Clean up temp file
+    fs.unlinkSync(tempPath);
+
+    return res.json({
+      success: true,
+      driveFile: {
+        id: driveFile.id,
+        name: driveFile.name,
+        webViewLink: driveFile.webViewLink
+      }
+    });
+  } catch (err) {
+    console.error('Upload to Drive failed:', err.message);
+    return res.status(500).json({ message: 'Upload failed', error: err.message });
   }
 });
 
