@@ -6,6 +6,7 @@ const passport = require('passport');
 const User = require('../models/User');
 
 const router = express.Router();
+const axios = require('axios');
 
 // Register
 router.post('/register', async (req, res) => {
@@ -116,8 +117,16 @@ router.post('/reset-password', async (req, res) => {
   }
 });
 
-// Google Auth
-router.get('/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
+// Google Auth - request Drive readonly + offline access at login so permission is granted once
+console.log('Registering GET /auth/google route');
+router.get('/google', (req, res, next) => {
+  console.log('GET /auth/google called');
+  passport.authenticate('google', {
+    scope: ['profile', 'email', 'https://www.googleapis.com/auth/drive.readonly'],
+    accessType: 'offline',
+    prompt: 'consent'
+  })(req, res, next);
+});
 router.get('/google/callback', passport.authenticate('google', { failureRedirect: '/' }), (req, res) => {
   const token = jwt.sign({ id: req.user._id }, process.env.JWT_SECRET, { expiresIn: '1h' });
   res.redirect(`http://localhost:3000?token=${token}`); // redirect to frontend
@@ -146,6 +155,34 @@ router.get('/me', async (req, res) => {
     });
   } catch (err) {
     res.status(401).json({ message: 'Invalid token' });
+  }
+});
+
+// Return a fresh Drive access token using stored refresh token
+router.get('/drive-token', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.split(' ')[1];
+  if (!token) return res.status(401).json({ message: 'No token' });
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await User.findById(decoded.id);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    if (!user.googleRefreshToken) return res.status(400).json({ message: 'No Google refresh token available' });
+
+    const params = new URLSearchParams();
+    params.append('client_id', process.env.GOOGLE_CLIENT_ID);
+    params.append('client_secret', process.env.GOOGLE_CLIENT_SECRET);
+    params.append('refresh_token', user.googleRefreshToken);
+    params.append('grant_type', 'refresh_token');
+
+    const tokenResp = await axios.post('https://oauth2.googleapis.com/token', params.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+    });
+
+    return res.json({ access_token: tokenResp.data.access_token, expires_in: tokenResp.data.expires_in });
+  } catch (err) {
+    console.error('drive-token error', err?.message || err);
+    return res.status(400).json({ message: 'Failed to obtain drive token' });
   }
 });
 

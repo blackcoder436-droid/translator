@@ -1,0 +1,17 @@
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 1280
+PlayResY: 720
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Noto Sans Myanmar,36,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,2,10,10,40,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,00:00:00.00,00:00:02.44,Default,,0,0,0,,မင်းရဲ့ စိတ်ပိုင်းဆိုင်ရာ ထောင်ချောက်တွေထဲက တစ်ခုထဲ ငါ့ကို သွေးဆောင်ဖို့ မကြိုးစားပါနဲ့။
+Dialogue: 0,00:00:02.44,00:00:04.44,Default,,0,0,0,,ဘယ်သူမှ မင်းကို ဖမ်းဖို့ မကြိုးစားဘူး။
+Dialogue: 0,00:00:04.44,00:00:06.74,Default,,0,0,0,,မင်းရဲ့ စိတ်ခံစားချက်တွေကို စီမံဆောင်ရွက်ပေးဖို့ ငါဒီမှာရှိတယ်။
+Dialogue: 0,00:00:06.74,00:00:08.74,Default,,0,0,0,,စိတ်ခံစားမှုများသည် တံခါးပေါက်တစ်ခုဖြစ်သည်။
+Dialogue: 0,00:00:08.74,00:00:10.74,Default,,0,0,0,,သူတို့သည် ခံစားချက်များဆီသို့ ဦးတည်ကာ မျက်ရည်ကျစေသည်။
+Dialogue: 0,00:00:11.74,00:00:13.74,Default,,0,0,0,,မျက်ရည်မကျပါဘူး။

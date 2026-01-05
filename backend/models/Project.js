@@ -5,6 +5,7 @@ const projectSchema = new mongoose.Schema({
   projectName: { type: String, required: true },
   videoPath: { type: String, required: true },
   srtPath: { type: String, required: false, default: '' },
+  exportedPath: { type: String, required: false, default: '' },
   studioSettings: { type: Object, required: false, default: {} },
   status: { type: String, enum: ['processing','completed','failed'], default: 'processing' },
   progress: { type: Number, default: 0 },

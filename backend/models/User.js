@@ -8,6 +8,8 @@ const userSchema = new mongoose.Schema({
   banned_at: Date,
   role: { type: String, default: 'user' },
   googleId: { type: String },
+  googleAccessToken: { type: String },
+  googleRefreshToken: { type: String },
   resetToken: { type: String },
   resetTokenExpiry: { type: Date },
 }, { timestamps: true });
